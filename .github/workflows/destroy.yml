@@ -1,0 +1,165 @@
+name: Destroy GCP Resources
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type DESTROY to confirm resource deletion"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  SERVICE_NAME: meridian-ai-cloud-run
+  IMAGE_NAME: gcr.io/${{ secrets.GCP_PROJECT_ID }}/meridian-ai-cloud-run
+  VECTOR_BUCKET: gs://${{ secrets.GCP_PROJECT_ID }}-vector-staging
+  INDEX_NAME: financial-docs-production
+  ENDPOINT_NAME: financial-docs-endpoint
+
+jobs:
+  destroy:
+    name: Destroy GCP Infrastructure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate Confirmation
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          if [[ "$CONFIRMATION" != "DESTROY" ]]; then
+            echo "Invalid confirmation."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      # Step 1: Delete Cloud Run
+      - name: Delete Cloud Run Service
+        run: |
+          if gcloud run services describe "$SERVICE_NAME" \
+            --region="$REGION" \
+            --project="$PROJECT_ID" >/dev/null 2>&1; then
+
+            gcloud run services delete "$SERVICE_NAME" \
+              --region="$REGION" \
+              --project="$PROJECT_ID" \
+              --quiet
+          else
+            echo "Cloud Run service not found."
+          fi
+
+      # Step 2: Undeploy Vertex AI Index
+      - name: Undeploy Vector Search Index
+        run: |
+          ENDPOINT_ID=$(gcloud ai index-endpoints list \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --filter="displayName=$ENDPOINT_NAME" \
+            --format="value(name)" \
+            --limit=1)
+
+          if [[ -n "$ENDPOINT_ID" ]]; then
+            DEPLOYED_IDS=$(gcloud ai index-endpoints describe \
+              "$ENDPOINT_ID" \
+              --region="$REGION" \
+              --project="$PROJECT_ID" \
+              --format="value(deployedIndexes.id)")
+
+            for DEPLOYED_ID in $DEPLOYED_IDS; do
+              gcloud ai index-endpoints undeploy-index \
+                "$ENDPOINT_ID" \
+                --deployed-index-id="$DEPLOYED_ID" \
+                --region="$REGION" \
+                --project="$PROJECT_ID" \
+                --quiet
+            done
+          fi
+
+      # Step 3: Delete Vertex AI Endpoint
+      - name: Delete Vector Search Endpoint
+        run: |
+          ENDPOINT_ID=$(gcloud ai index-endpoints list \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --filter="displayName=$ENDPOINT_NAME" \
+            --format="value(name)" \
+            --limit=1)
+
+          if [[ -n "$ENDPOINT_ID" ]]; then
+            gcloud ai index-endpoints delete "$ENDPOINT_ID" \
+              --region="$REGION" \
+              --project="$PROJECT_ID" \
+              --quiet
+          fi
+
+      # Step 4: Delete Vertex AI Index
+      - name: Delete Vector Search Index
+        run: |
+          INDEX_ID=$(gcloud ai indexes list \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --filter="displayName=$INDEX_NAME" \
+            --format="value(name)" \
+            --limit=1)
+
+          if [[ -n "$INDEX_ID" ]]; then
+            gcloud ai indexes delete "$INDEX_ID" \
+              --region="$REGION" \
+              --project="$PROJECT_ID" \
+              --quiet
+          fi
+
+      # Step 5: Delete Storage Bucket
+      - name: Delete GCS Bucket
+        run: |
+          if gcloud storage buckets describe "$VECTOR_BUCKET" \
+            --project="$PROJECT_ID" >/dev/null 2>&1; then
+
+            gcloud storage rm --recursive "$VECTOR_BUCKET"
+          fi
+
+      # Step 6: Delete Secret Manager Secret
+      - name: Delete Secret
+        run: |
+          if gcloud secrets describe GOOGLE_API_KEY \
+            --project="$PROJECT_ID" >/dev/null 2>&1; then
+
+            gcloud secrets delete GOOGLE_API_KEY \
+              --project="$PROJECT_ID" \
+              --quiet
+          fi
+
+      # Step 7: Delete Container Images
+      - name: Delete Container Images
+        run: |
+          IMAGES=$(gcloud container images list-tags "$IMAGE_NAME" \
+            --project="$PROJECT_ID" \
+            --format="value(digest)" 2>/dev/null || true)
+
+          for DIGEST in $IMAGES; do
+            gcloud container images delete \
+              "${IMAGE_NAME}@${DIGEST}" \
+              --project="$PROJECT_ID" \
+              --force-delete-tags \
+              --quiet
+          done
+
+      - name: Cleanup Complete
+        run: |
+          echo "GCP application resources deleted."
