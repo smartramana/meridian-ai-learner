@@ -11,6 +11,7 @@ on:
 permissions:
   contents: read
 
+# Shares the deploy group on purpose: a destroy never runs alongside a deploy.
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
@@ -21,6 +22,8 @@ env:
   SERVICE_NAME: meridian-ai-cloud-run
   IMAGE_NAME: gcr.io/${{ secrets.GCP_PROJECT_ID }}/meridian-ai-cloud-run
   VECTOR_BUCKET: gs://${{ secrets.GCP_PROJECT_ID }}-vector-staging
+  # Created implicitly by `gcloud builds submit` to stage uploaded source. Note the underscore.
+  CLOUDBUILD_BUCKET: gs://${{ secrets.GCP_PROJECT_ID }}_cloudbuild
   INDEX_NAME: financial-docs-production
   ENDPOINT_NAME: financial-docs-endpoint
 
@@ -49,8 +52,14 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
+      # Every deletion step below is continue-on-error so that one stuck resource
+      # (Vertex AI in particular) can never strand the bucket or the registry.
+      # The final step re-reads every outcome and fails the job if anything broke.
+
       # Step 1: Delete Cloud Run
       - name: Delete Cloud Run Service
+        id: cloud_run
+        continue-on-error: true
         run: |
           if gcloud run services describe "$SERVICE_NAME" \
             --region="$REGION" \
@@ -66,6 +75,8 @@ jobs:
 
       # Step 2: Undeploy Vertex AI Index
       - name: Undeploy Vector Search Index
+        id: undeploy_index
+        continue-on-error: true
         run: |
           ENDPOINT_ID=$(gcloud ai index-endpoints list \
             --region="$REGION" \
@@ -74,25 +85,50 @@ jobs:
             --format="value(name)" \
             --limit=1)
 
-          if [[ -n "$ENDPOINT_ID" ]]; then
-            DEPLOYED_IDS=$(gcloud ai index-endpoints describe \
-              "$ENDPOINT_ID" \
+          if [[ -z "$ENDPOINT_ID" ]]; then
+            echo "Endpoint not found."
+            exit 0
+          fi
+
+          # --flatten gives one id per line. A bare value(deployedIndexes.id) joins
+          # repeated fields with ';', which the loop below would read as a single id.
+          DEPLOYED_IDS=$(gcloud ai index-endpoints describe "$ENDPOINT_ID" \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --flatten="deployedIndexes[]" \
+            --format="value(deployedIndexes.id)")
+
+          for DEPLOYED_ID in $DEPLOYED_IDS; do
+            echo "Undeploying $DEPLOYED_ID"
+            gcloud ai index-endpoints undeploy-index "$ENDPOINT_ID" \
+              --deployed-index-id="$DEPLOYED_ID" \
               --region="$REGION" \
               --project="$PROJECT_ID" \
-              --format="value(deployedIndexes.id)")
+              --quiet
+          done
 
-            for DEPLOYED_ID in $DEPLOYED_IDS; do
-              gcloud ai index-endpoints undeploy-index \
-                "$ENDPOINT_ID" \
-                --deployed-index-id="$DEPLOYED_ID" \
-                --region="$REGION" \
-                --project="$PROJECT_ID" \
-                --quiet
-            done
-          fi
+          # The index cannot be deleted while it is still attached, so wait for the
+          # endpoint to report zero deployed indexes before later steps run.
+          for attempt in $(seq 1 30); do
+            REMAINING=$(gcloud ai index-endpoints describe "$ENDPOINT_ID" \
+              --region="$REGION" \
+              --project="$PROJECT_ID" \
+              --flatten="deployedIndexes[]" \
+              --format="value(deployedIndexes.id)" 2>/dev/null || true)
+
+            if [[ -z "$REMAINING" ]]; then
+              echo "All indexes undeployed."
+              break
+            fi
+
+            echo "Attempt $attempt/30: still undeploying... waiting 30 seconds."
+            sleep 30
+          done
 
       # Step 3: Delete Vertex AI Endpoint
       - name: Delete Vector Search Endpoint
+        id: delete_endpoint
+        continue-on-error: true
         run: |
           ENDPOINT_ID=$(gcloud ai index-endpoints list \
             --region="$REGION" \
@@ -106,10 +142,14 @@ jobs:
               --region="$REGION" \
               --project="$PROJECT_ID" \
               --quiet
+          else
+            echo "Endpoint not found."
           fi
 
       # Step 4: Delete Vertex AI Index
       - name: Delete Vector Search Index
+        id: delete_index
+        continue-on-error: true
         run: |
           INDEX_ID=$(gcloud ai indexes list \
             --region="$REGION" \
@@ -123,19 +163,48 @@ jobs:
               --region="$REGION" \
               --project="$PROJECT_ID" \
               --quiet
+          else
+            echo "Index not found."
           fi
 
-      # Step 5: Delete Storage Bucket
-      - name: Delete GCS Bucket
+      # Step 5: Delete Storage Buckets
+      - name: Delete GCS Buckets
+        id: delete_buckets
+        continue-on-error: true
         run: |
-          if gcloud storage buckets describe "$VECTOR_BUCKET" \
-            --project="$PROJECT_ID" >/dev/null 2>&1; then
+          FAILED=0
 
-            gcloud storage rm --recursive "$VECTOR_BUCKET"
-          fi
+          # `rm --recursive gs://bucket` removes every object version and then the
+          # bucket itself. On an already-empty bucket some gcloud versions report
+          # "matched no objects", so fall back to an explicit bucket delete.
+          for BUCKET in "$VECTOR_BUCKET" "$CLOUDBUILD_BUCKET"; do
+            if ! gcloud storage buckets describe "$BUCKET" \
+              --project="$PROJECT_ID" >/dev/null 2>&1; then
+              echo "Bucket $BUCKET not found."
+              continue
+            fi
+
+            echo "Deleting $BUCKET ..."
+            if ! gcloud storage rm --recursive "$BUCKET" --project="$PROJECT_ID" --quiet; then
+              echo "Recursive delete failed for $BUCKET; trying explicit bucket delete."
+              gcloud storage buckets delete "$BUCKET" --project="$PROJECT_ID" --quiet || true
+            fi
+
+            if gcloud storage buckets describe "$BUCKET" \
+              --project="$PROJECT_ID" >/dev/null 2>&1; then
+              echo "ERROR: $BUCKET still exists."
+              FAILED=1
+            else
+              echo "Deleted $BUCKET"
+            fi
+          done
+
+          exit "$FAILED"
 
       # Step 6: Delete Secret Manager Secret
       - name: Delete Secret
+        id: delete_secret
+        continue-on-error: true
         run: |
           if gcloud secrets describe GOOGLE_API_KEY \
             --project="$PROJECT_ID" >/dev/null 2>&1; then
@@ -143,17 +212,21 @@ jobs:
             gcloud secrets delete GOOGLE_API_KEY \
               --project="$PROJECT_ID" \
               --quiet
+          else
+            echo "Secret not found."
           fi
 
       # Step 7: Delete Container Images
       - name: Delete Container Images
+        id: delete_images
+        continue-on-error: true
         shell: bash
         run: |
           echo "Deleting container images from $IMAGE_NAME"
 
           IMAGES=$(gcloud container images list-tags "$IMAGE_NAME" \
             --project="$PROJECT_ID" \
-            --format=json | jq -r '.[].digest // empty')
+            --format=json 2>/dev/null | jq -r '.[].digest // empty' || true)
 
           if [[ -z "$IMAGES" ]]; then
             echo "No container images found."
@@ -181,6 +254,96 @@ jobs:
 
           echo "All container images deleted successfully."
 
-      - name: Cleanup Complete
+      # Step 8: Delete the Artifact Registry repositories themselves.
+      # Deleting image digests (step 7) empties the repo but leaves it behind.
+      # Container Registry shut down in March 2025, so gcr.io/<project> is really
+      # an Artifact Registry repo named "gcr.io" in the "us" multi-region.
+      - name: Delete Artifact Registry Repositories
+        id: delete_artifact_repos
+        continue-on-error: true
         run: |
+          # Allowlist: only repos this project's deploy workflow creates implicitly.
+          # Anything else in the project is left untouched.
+          MANAGED="gcr.io us.gcr.io eu.gcr.io asia.gcr.io cloud-run-source-deploy"
+
+          REPOS=$(gcloud artifacts repositories list \
+            --project="$PROJECT_ID" \
+            --format="value(name)" 2>/dev/null || true)
+
+          if [[ -z "$REPOS" ]]; then
+            echo "No Artifact Registry repositories found."
+            exit 0
+          fi
+
+          echo "Repositories found in project:"
+          echo "$REPOS"
+
+          FAILED=0
+          while IFS= read -r REPO_PATH; do
+            [[ -z "$REPO_PATH" ]] && continue
+
+            # REPO_PATH looks like projects/<p>/locations/<loc>/repositories/<repo>
+            REPO_ID="${REPO_PATH##*/}"
+            LOCATION=$(echo "$REPO_PATH" | awk -F'/locations/' '{print $2}' | cut -d/ -f1)
+
+            if [[ -z "$LOCATION" || -z "$REPO_ID" ]]; then
+              echo "Skipping unparseable repository: $REPO_PATH"
+              continue
+            fi
+
+            if [[ " $MANAGED " != *" $REPO_ID "* ]]; then
+              echo "Skipping unmanaged repository: $REPO_ID ($LOCATION)"
+              continue
+            fi
+
+            echo "Deleting Artifact Registry repo $REPO_ID in $LOCATION ..."
+            if gcloud artifacts repositories delete "$REPO_ID" \
+              --location="$LOCATION" \
+              --project="$PROJECT_ID" \
+              --quiet; then
+              echo "Deleted $REPO_ID"
+            else
+              echo "ERROR: failed to delete $REPO_ID in $LOCATION"
+              FAILED=1
+            fi
+          done <<< "$REPOS"
+
+          exit "$FAILED"
+
+      - name: Cleanup Summary
+        if: always()
+        env:
+          R_CLOUD_RUN: ${{ steps.cloud_run.outcome }}
+          R_UNDEPLOY: ${{ steps.undeploy_index.outcome }}
+          R_ENDPOINT: ${{ steps.delete_endpoint.outcome }}
+          R_INDEX: ${{ steps.delete_index.outcome }}
+          R_BUCKETS: ${{ steps.delete_buckets.outcome }}
+          R_SECRET: ${{ steps.delete_secret.outcome }}
+          R_IMAGES: ${{ steps.delete_images.outcome }}
+          R_REPOS: ${{ steps.delete_artifact_repos.outcome }}
+        run: |
+          FAILED=0
+
+          report() {
+            printf '%-28s %s\n' "$1" "$2"
+            [[ "$2" == "success" ]] || FAILED=1
+          }
+
+          echo "=== Destroy results ==="
+          report "Cloud Run service"      "$R_CLOUD_RUN"
+          report "Vector index undeploy"  "$R_UNDEPLOY"
+          report "Vector endpoint"        "$R_ENDPOINT"
+          report "Vector index"           "$R_INDEX"
+          report "GCS buckets"            "$R_BUCKETS"
+          report "Secret Manager secret"  "$R_SECRET"
+          report "Container images"       "$R_IMAGES"
+          report "Artifact Registry repos" "$R_REPOS"
+
+          if [[ "$FAILED" -ne 0 ]]; then
+            echo ""
+            echo "Some resources were not deleted. Re-run this workflow; it skips what is already gone."
+            exit 1
+          fi
+
+          echo ""
           echo "GCP application resources deleted."
