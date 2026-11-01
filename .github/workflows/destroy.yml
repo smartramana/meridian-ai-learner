@@ -262,52 +262,83 @@ jobs:
         id: delete_artifact_repos
         continue-on-error: true
         run: |
-          # Allowlist: only repos this project's deploy workflow creates implicitly.
-          # Anything else in the project is left untouched.
-          MANAGED="gcr.io us.gcr.io eu.gcr.io asia.gcr.io cloud-run-source-deploy"
+          # Deleting a repo needs artifactregistry.repositories.delete. Self-grant it
+          # the same way the deploy workflow grants itself run.admin/secretmanager.admin.
+          DEPLOYER_SA=$(gcloud config get account 2>/dev/null)
+          echo "Granting Artifact Registry Admin to $DEPLOYER_SA ..."
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:${DEPLOYER_SA}" \
+            --role="roles/artifactregistry.admin" --condition=None >/dev/null 2>&1 \
+            || echo "Could not self-grant artifactregistry.admin; continuing."
 
-          REPOS=$(gcloud artifacts repositories list \
-            --project="$PROJECT_ID" \
-            --format="value(name)" 2>/dev/null || true)
+          echo "--- Repositories currently in project ---"
+          gcloud artifacts repositories list --project="$PROJECT_ID" \
+            --format="table(name,format,location)" || echo "(list failed)"
 
-          if [[ -z "$REPOS" ]]; then
-            echo "No Artifact Registry repositories found."
-            exit 0
-          fi
-
-          echo "Repositories found in project:"
-          echo "$REPOS"
+          # Explicit location:repo pairs, per Google's documented gcr.io mapping
+          # (gcr.io -> us, eu.gcr.io -> europe, asia.gcr.io -> asia).
+          # Deliberately NOT parsed out of `repositories list`: that command's `name`
+          # field is a short id in some gcloud releases and a full resource path in
+          # others, and guessing wrong silently skips the repo. Addressing each repo
+          # directly also means unrelated repos are never touched.
+          CANDIDATES="us:gcr.io us:us.gcr.io europe:eu.gcr.io asia:asia.gcr.io ${REGION}:cloud-run-source-deploy"
 
           FAILED=0
-          while IFS= read -r REPO_PATH; do
-            [[ -z "$REPO_PATH" ]] && continue
+          DELETED=0
 
-            # REPO_PATH looks like projects/<p>/locations/<loc>/repositories/<repo>
-            REPO_ID="${REPO_PATH##*/}"
-            LOCATION=$(echo "$REPO_PATH" | awk -F'/locations/' '{print $2}' | cut -d/ -f1)
-
-            if [[ -z "$LOCATION" || -z "$REPO_ID" ]]; then
-              echo "Skipping unparseable repository: $REPO_PATH"
-              continue
+          repo_exists() {
+            # Echoes "yes"/"no", or "error" when the check itself could not run
+            # (for example PERMISSION_DENIED) so it is never mistaken for "absent".
+            local repo="$1" loc="$2" out
+            if out=$(gcloud artifacts repositories describe "$repo" \
+                       --location="$loc" --project="$PROJECT_ID" 2>&1); then
+              echo "yes"
+            elif grep -qiE 'not found|does not exist|NOT_FOUND' <<<"$out"; then
+              echo "no"
+            else
+              echo "error: $out"
             fi
+          }
 
-            if [[ " $MANAGED " != *" $REPO_ID "* ]]; then
-              echo "Skipping unmanaged repository: $REPO_ID ($LOCATION)"
-              continue
-            fi
+          for CANDIDATE in $CANDIDATES; do
+            LOCATION="${CANDIDATE%%:*}"
+            REPO_ID="${CANDIDATE#*:}"
+
+            STATUS=$(repo_exists "$REPO_ID" "$LOCATION")
+
+            case "$STATUS" in
+              no)
+                echo "No repository $REPO_ID in $LOCATION."
+                continue
+                ;;
+              error*)
+                echo "ERROR: could not check $REPO_ID in $LOCATION: ${STATUS#error: }"
+                FAILED=1
+                continue
+                ;;
+            esac
 
             echo "Deleting Artifact Registry repo $REPO_ID in $LOCATION ..."
-            if gcloud artifacts repositories delete "$REPO_ID" \
+            gcloud artifacts repositories delete "$REPO_ID" \
               --location="$LOCATION" \
               --project="$PROJECT_ID" \
-              --quiet; then
-              echo "Deleted $REPO_ID"
+              --quiet || echo "Delete command reported an error for $REPO_ID."
+
+            # Trust the API, not the command's exit code: re-check that it is gone.
+            if [[ "$(repo_exists "$REPO_ID" "$LOCATION")" == "no" ]]; then
+              echo "Deleted $REPO_ID in $LOCATION."
+              DELETED=$((DELETED + 1))
             else
-              echo "ERROR: failed to delete $REPO_ID in $LOCATION"
+              echo "ERROR: $REPO_ID in $LOCATION still exists after delete."
               FAILED=1
             fi
-          done <<< "$REPOS"
+          done
 
+          echo "--- Repositories remaining ---"
+          gcloud artifacts repositories list --project="$PROJECT_ID" \
+            --format="table(name,format,location)" || echo "(list failed)"
+
+          echo "Repositories deleted: $DELETED"
           exit "$FAILED"
 
       - name: Cleanup Summary
